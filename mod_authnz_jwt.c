@@ -171,6 +171,7 @@ static const char *add_authn_provider(cmd_parms * cmd, void *config, const char 
 static const char *set_jwt_param(cmd_parms * cmd, void* config, const char* value);
 static const char *set_jwt_int_param(cmd_parms * cmd, void* config, const char* value);
 static const char* get_config_value(request_rec *r, jwt_directive directive);
+static const char* get_config_value_from_list(request_rec *r, jwt_directive directive, int i);
 static const int get_config_int_value(request_rec *r, jwt_directive directive);
 
 static const char *jwt_parse_config(cmd_parms *cmd, const char *require_line, const void **parsed_require_line);
@@ -192,7 +193,7 @@ static int create_token(request_rec *r, char** token_str, const char* username);
 static int auth_jwt_authn_with_token(request_rec *r);
 
 static void get_encode_key(request_rec* r, const char* algorithm, unsigned char* key, unsigned int* keylen);
-static void get_decode_key(request_rec* r, unsigned char* key, unsigned int* keylen);
+static void get_decode_key(request_rec* r, unsigned char* key, int i);
 static int token_check(request_rec *r, jwt_t **jwt, const char *token, const unsigned char *key, unsigned int keylen);
 static int token_decode(jwt_t **jwt, const char* token, const unsigned char *key, unsigned int keylen);
 static int token_new(jwt_t **jwt);
@@ -378,6 +379,19 @@ AP_DECLARE_MODULE(auth_jwt) = {
 };
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~  FILL OUT CONF STRUCTURES ~~~~~~~~~~~~~~~~~~~~~~~~~~~~  */
+
+static const char* get_config_value_from_list(request_rec *r, jwt_directive directive, int i)
+{
+	const char* value = get_config_value(r, directive);
+	while (i-- > 0 && value)
+		value = strchr(value, ';');
+	if (!value)
+		return 0;
+	if (const char* end = strchr(value, ';'))
+		return strndup(value, end - value);
+	else
+		return strdup(value);
+}
 
 static const char* get_config_value(request_rec *r, jwt_directive directive){
 
@@ -1152,7 +1166,7 @@ static bool find_query_parameter(const char* query, const char* parameter_name, 
 static int auth_jwt_authn_with_token(request_rec *r){
 	const char *current_auth = NULL;
 	current_auth = ap_auth_type(r);
-	int rv;
+	int rv = HTTP_UNAUTHORIZED;
 
 	if (!current_auth || strncmp(current_auth, "jwt", 3) != 0) {
 		return DECLINED;
@@ -1274,22 +1288,19 @@ static int auth_jwt_authn_with_token(request_rec *r){
 	}
 
 	unsigned char key[MAX_KEY_LEN] = { 0 };
-	unsigned int keylen;
 
-	get_decode_key(r, key, &keylen);
-
-	if(keylen == 0){
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55403)
-							"auth_jwt authn: key used to check signature is empty");
-		if (token_str_buffer)
-			free(token_str_buffer);
-		return HTTP_INTERNAL_SERVER_ERROR;
+	for (int i = 0;rv != OK;++i)
+	{
+		if (unsigned int keylen = get_decode_key(r, key, &keylen, i))
+		{
+			jwt_t* token;
+			ap_log_rerror(
+				APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(55405)
+				"auth_jwt authn: checking signature and fields correctness..."
+			);
+			rv = token_check(r, &token, token_str, key, keylen);
+		}
 	}
-
-	jwt_t* token;
-	ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(55405)
-						"auth_jwt authn: checking signature and fields correctness...");
-	rv = token_check(r, &token, token_str, key, keylen);
 
 	if (token_str_buffer)
 		free(token_str_buffer);
@@ -1323,7 +1334,6 @@ static int auth_jwt_authn_with_token(request_rec *r){
 	} else {
 		if(token)
 			token_free(token);
-
 		return rv;
 	}
 }
@@ -1381,32 +1391,26 @@ static void get_encode_key(request_rec *r, const char* signature_algorithm, unsi
 	}
 }
 
-static void get_decode_key(request_rec *r, unsigned char* key, unsigned int* keylen){
-	char* signature_public_key_file = (char*)get_config_value(r, dir_signature_public_key_file);
-	char* signature_shared_secret = (char*)get_config_value(r, dir_signature_shared_secret);
-
+static void get_decode_key(request_rec *r, unsigned char* key, int i)
+{
+	unsigned int result = 0;
+	char* signature_public_key_file = (char*)get_config_value_from_list(r, dir_signature_public_key_file, i);
+	char* signature_shared_secret = (char*)get_config_value_from_list(r, dir_signature_shared_secret, i);
 	if(!signature_shared_secret && !signature_public_key_file){
 		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55507)
 				"You must specify either AuthJWTSignatureSharedSecret directive or AuthJWTSignaturePublicKeyFile directive in configuration for decoding process");
-		return;
-	}
-
-	if(signature_shared_secret && signature_public_key_file){
+	} else if(signature_shared_secret && signature_public_key_file){
 		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55507)
 				"Conflict in configuration: you must specify either AuthJWTSignatureSharedSecret directive or AuthJWTSignaturePublicKeyFile directive but not both in the same block");
-		return;
-	}
-
-	if(signature_shared_secret){
+	} else if(signature_shared_secret){
 		apr_pool_t *base64_decode_pool;
 		apr_pool_create(&base64_decode_pool, NULL);
 		size_t decoded_len, buf_len = apr_base64_decode_len((const char*)signature_shared_secret);
 		char *decode_buf = apr_pcalloc(base64_decode_pool, buf_len);
 		decoded_len = apr_base64_decode(decode_buf, signature_shared_secret);
 		memcpy((char*)key, (const char*)decode_buf, decoded_len);
-		*keylen = (unsigned int)decoded_len;
-	}
-	else if(signature_public_key_file){
+		result = decoded_len;
+	} else if(signature_public_key_file){
 		apr_status_t rv;
 		apr_file_t* key_fd = NULL;
 		rv = apr_file_open(&key_fd, signature_public_key_file, APR_FOPEN_READ, APR_FPROT_OS_DEFAULT, r->pool);
@@ -1423,9 +1427,14 @@ static void get_decode_key(request_rec *r, unsigned char* key, unsigned int* key
 					"Error while reading the file %s", signature_public_key_file);
 			return;
 		}
-		*keylen = (unsigned int)key_len;
 		apr_file_close(key_fd);
+		result = key_len;
 	}
+	if (signature_shared_secret)
+		free(signature_shared_secret);
+	if (signature_public_key_file)
+		free(signature_public_key_file);
+	return result;
 }
 
 static int token_new(jwt_t **jwt){
@@ -1433,16 +1442,27 @@ static int token_new(jwt_t **jwt){
 }
 
 
-static int token_check(request_rec *r, jwt_t **jwt, const char *token, const unsigned char *key, unsigned int keylen){
+static int token_check(
+	request_rec *r,
+	jwt_t **jwt,
+	const char *token,
+	const unsigned char *key,
+	unsigned int keylen,
+	int i
+)
+{
 
 	int decode_res = token_decode(jwt, token, key, keylen);
+	const char* iss_config = (char *)get_config_value_from_list(r, dir_iss, i);
+	const char* aud_config = (char *)get_config_value_from_list(r, dir_aud, i);
+	int result = HTTP_UNAUTHORIZED;
 
 	if(decode_res != 0){
 		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55512)"Decoding process has failed, token is either malformed or signature is invalid");
 		apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
 		"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Token is malformed or signature is invalid\"",
 		NULL));
-		return HTTP_UNAUTHORIZED;
+		goto end;
 	}
 
 	/*
@@ -1453,11 +1473,9 @@ static int token_check(request_rec *r, jwt_t **jwt, const char *token, const uns
 		apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
 		"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Token is malformed\"",
 		NULL));
-		return HTTP_UNAUTHORIZED;
+		goto end;
 	}
 
-	const char* iss_config = (char *)get_config_value(r, dir_iss);
-	const char* aud_config = (char *)get_config_value(r, dir_aud);
 	int leeway = get_config_int_value(r, dir_leeway);
 
 	const char* iss_to_check = token_get_claim(*jwt, "iss");
@@ -1466,16 +1484,16 @@ static int token_check(request_rec *r, jwt_t **jwt, const char *token, const uns
 		apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
 		"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Issuer is not valid\"",
 		NULL));
-		return HTTP_UNAUTHORIZED;
 	}
 
+	/* check aud */
 	const char* aud_to_check = token_get_claim(*jwt, "aud");
 	if(aud_config && aud_to_check && strcmp(aud_config, aud_to_check)!=0){
 		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55514)"Token audience does not match with configured audience");
 		apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
 		"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Audience is not valid\"",
 		NULL));
-		return HTTP_UNAUTHORIZED;
+		goto end;
 	}
 
 	/* check exp */
@@ -1488,7 +1506,7 @@ static int token_check(request_rec *r, jwt_t **jwt, const char *token, const uns
 			apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
 			"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Token expired\"",
 			NULL));
-			return HTTP_UNAUTHORIZED;
+			goto end;
 		}
 	}
 
@@ -1502,7 +1520,7 @@ static int token_check(request_rec *r, jwt_t **jwt, const char *token, const uns
 			apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
 			"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Token can't be processed now due to nbf field\"",
 			NULL));
-			return HTTP_UNAUTHORIZED;
+			goto end;
 		}
 	}
 
@@ -1514,9 +1532,17 @@ static int token_check(request_rec *r, jwt_t **jwt, const char *token, const uns
 		apr_table_setn(r->err_headers_out, "WWW-Authenticate", apr_pstrcat(r->pool,
 		"Bearer realm=\"", ap_auth_name(r),"\", error=\"invalid_token\", error_description=\"Unsupported Signature Algorithm\"",
 		NULL));
-		return HTTP_UNAUTHORIZED;
+		goto end;
 	}
-	return 	OK;
+
+	result = OK;
+
+end:
+	if (iss_config)
+		free(iss_config);
+	if (aud_config)
+		free(aud_config);
+	return 	result;
 }
 
 static int token_decode(jwt_t **jwt, const char* token, const unsigned char *key, unsigned int keylen){
