@@ -193,8 +193,8 @@ static int create_token(request_rec *r, char** token_str, const char* username);
 static int auth_jwt_authn_with_token(request_rec *r);
 
 static void get_encode_key(request_rec* r, const char* algorithm, unsigned char* key, unsigned int* keylen);
-static void get_decode_key(request_rec* r, unsigned char* key, int i);
-static int token_check(request_rec *r, jwt_t **jwt, const char *token, const unsigned char *key, unsigned int keylen);
+static unsigned int get_decode_key(request_rec* r, unsigned char* key, int i);
+static int token_check(request_rec *r, jwt_t **jwt, const char *token, const unsigned char *key, unsigned int keylen, int i);
 static int token_decode(jwt_t **jwt, const char* token, const unsigned char *key, unsigned int keylen);
 static int token_new(jwt_t **jwt);
 static const char* token_get_claim(jwt_t *token, const char* claim);
@@ -387,7 +387,8 @@ static const char* get_config_value_from_list(request_rec *r, jwt_directive dire
 		value = strchr(value, ';');
 	if (!value)
 		return 0;
-	if (const char* end = strchr(value, ';'))
+        const char* end;
+	if ((end = strchr(value, ';')))
 		return strndup(value, end - value);
 	else
 		return strdup(value);
@@ -1288,18 +1289,23 @@ static int auth_jwt_authn_with_token(request_rec *r){
 	}
 
 	unsigned char key[MAX_KEY_LEN] = { 0 };
+        jwt_t* token = 0;
 
 	for (int i = 0;rv != OK;++i)
 	{
-		if (unsigned int keylen = get_decode_key(r, key, &keylen, i))
+                unsigned int keylen;
+		if ((keylen = get_decode_key(r, key, i)))
 		{
-			jwt_t* token;
 			ap_log_rerror(
 				APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(55405)
 				"auth_jwt authn: checking signature and fields correctness..."
 			);
-			rv = token_check(r, &token, token_str, key, keylen);
+			rv = token_check(r, &token, token_str, key, keylen, i);
 		}
+                else
+                {
+                        break;
+                }
 	}
 
 	if (token_str_buffer)
@@ -1330,12 +1336,11 @@ static int auth_jwt_authn_with_token(request_rec *r){
 		}else{
 			r->user = "anonymous";
 		}
-		return OK;
-	} else {
-		if(token)
-			token_free(token);
-		return rv;
+		rv = OK;
 	}
+        if(token)
+                token_free(token);
+        return rv;
 }
 
 
@@ -1391,7 +1396,7 @@ static void get_encode_key(request_rec *r, const char* signature_algorithm, unsi
 	}
 }
 
-static void get_decode_key(request_rec *r, unsigned char* key, int i)
+static unsigned int get_decode_key(request_rec *r, unsigned char* key, int i)
 {
 	unsigned int result = 0;
 	char* signature_public_key_file = (char*)get_config_value_from_list(r, dir_signature_public_key_file, i);
@@ -1415,20 +1420,28 @@ static void get_decode_key(request_rec *r, unsigned char* key, int i)
 		apr_file_t* key_fd = NULL;
 		rv = apr_file_open(&key_fd, signature_public_key_file, APR_FOPEN_READ, APR_FPROT_OS_DEFAULT, r->pool);
 		if(rv!=APR_SUCCESS){
-						char error_buf[50];
-						ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55503)
-										 "Unable to open the file %s: %s", signature_public_key_file, apr_strerror(rv, error_buf, 50));
-						return;
+                    char error_buf[50];
+                    ap_log_rerror(
+                        APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55503)
+                        "Unable to open the file %s: %s", 
+                        signature_public_key_file, 
+                        apr_strerror(rv, error_buf, 50)
+                    );
 		}
-		apr_size_t key_len;
-		rv = apr_file_read_full(key_fd, key, MAX_KEY_LEN, &key_len); 
-		if(rv!=APR_SUCCESS && rv!=APR_EOF){
+                else
+                {
+                    apr_size_t key_len;
+                    rv = apr_file_read_full(key_fd, key, MAX_KEY_LEN, &key_len); 
+                    if(rv!=APR_SUCCESS && rv!=APR_EOF){
 			ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, APLOGNO(55510)
-					"Error while reading the file %s", signature_public_key_file);
-			return;
-		}
+                                      "Error while reading the file %s", signature_public_key_file);
+                    }
+                    else
+                    {
+                        result = key_len;
+                    }
+                }
 		apr_file_close(key_fd);
-		result = key_len;
 	}
 	if (signature_shared_secret)
 		free(signature_shared_secret);
